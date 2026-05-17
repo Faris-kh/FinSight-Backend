@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import joblib
 import numpy as np
 import pandas as pd
+import json
 import os
 
 # --- 1. Create the FastAPI app ---
@@ -26,16 +27,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. Load the trained model once when the server starts ---
+# --- 3. Load the trained model and stats once when the server starts ---
 MODEL_PATH = "model.pkl"
+STATS_PATH = "model_stats.json"
 
 if not os.path.exists(MODEL_PATH):
-    raise RuntimeError(
-        "model.pkl not found. Please run: python train_model.py"
-    )
+    raise RuntimeError("model.pkl not found. Please run: python train_model.py")
 
 model = joblib.load(MODEL_PATH)
-print("✅ Model loaded successfully.")
+print("[OK] Model loaded.")
+
+_model_stats: dict = {}
+if os.path.exists(STATS_PATH):
+    with open(STATS_PATH) as f:
+        _model_stats = json.load(f)
+    print(f"[OK] Model stats loaded (MAE={_model_stats.get('mae')}, R2={_model_stats.get('r2')})")
 
 # --- 4. Define what the frontend must send (input shape) ---
 class ForecastRequest(BaseModel):
@@ -81,8 +87,9 @@ def forecast_cash_flow(data: ForecastRequest):
             predicted = float(model.predict(input_row)[0])
 
             uncertainty_pct = 0.08 + (month_ahead * 0.01)
-            upper = predicted * (1 + uncertainty_pct)
-            lower = predicted * (1 - uncertainty_pct)
+            band = abs(predicted) * uncertainty_pct
+            upper = predicted + band
+            lower = max(0.0, predicted - band)
 
             confidence = round(max(0.70, 0.95 - (month_ahead * 0.03)), 2)
 
@@ -99,7 +106,14 @@ def forecast_cash_flow(data: ForecastRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 8. Health check ---
+# --- 8. Model stats endpoint ---
+@app.get("/api/model/stats")
+def model_stats():
+    if not _model_stats:
+        raise HTTPException(status_code=404, detail="model_stats.json not found. Run train_model.py first.")
+    return _model_stats
+
+# --- 9. Health check ---
 @app.get("/")
 def health_check():
-    return {"status": "FinSight API is running ✅"}
+    return {"status": "FinSight API is running"}
