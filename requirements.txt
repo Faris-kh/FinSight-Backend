@@ -1,8 +1,5 @@
 fastapi==0.115.0
 uvicorn==0.30.6
-lightgbm==4.5.0
-joblib==1.4.2
-scikit-learn==1.5.2
 numpy==1.26.4
-pandas==2.2.3
+statsmodels==0.14.4
 python-multipart==0.0.9
