@@ -1,11 +1,10 @@
-import json
-import joblib
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import numpy as np
+
+from services.forecasting import PodPredictor
 
 # --- 1. App setup ---
 app = FastAPI(
@@ -27,14 +26,7 @@ app.add_middleware(
 )
 
 # --- 2. ML Artifacts (loaded once at startup, not per-request) ---
-_model = joblib.load("lgbm_risk_classifier.joblib")
-_industry_cats: list[str] = json.load(open("industry_categories.json"))
-
-# Must match the column order used in train_lgbm_model.py exactly.
-_FEATURE_COLS = [
-    "current_ratio", "debt_to_equity", "ebitda_margin",
-    "icr", "dscr", "altman_z_score", "industry",
-]
+_pod_predictor = PodPredictor()
 
 
 # --- 3. Schemas ---
@@ -71,11 +63,11 @@ class ForecastRequest(BaseModel):
     equity: float
     revenue: float
     expenses: float
-    industry: str                       # Must be in industry_categories.json
+    industry: str | None = None
     retainedEarnings: float | None = None
     inventory: float | None = None
     debtService: float | None = None    # annual figure
-    icr: float | None = None            # If absent, proxied from EBIT / estimated interest
+    interest_expense: float = 0.0       # annual interest expense; used to compute real ICR
     confidenceTier: str = "standard"
     loan_params: LoanParams | None = None
 
@@ -164,72 +156,53 @@ def _project_covenants(
     baseline_avg: float,
 ) -> list[MonthForecast]:
     inventory = data.inventory or 0.0
-    cl = data.currentLiabilities
-    std_dev = float(np.std(data.historicalCashFlows, ddof=1)) if len(data.historicalCashFlows) >= 2 else 0.0
-    ebit = data.revenue - data.expenses
+    cl        = data.currentLiabilities
+    std_dev   = float(np.std(data.historicalCashFlows, ddof=1)) if len(data.historicalCashFlows) >= 2 else 0.0
+    ebit      = data.revenue - data.expenses
 
-    # These two are constant across months — derive once outside the loop.
-    ebitda_margin = (ebit / data.revenue) * 100.0 if data.revenue != 0 else 0.0
-    estimated_interest = data.totalDebt * 0.06
-    icr = data.icr if data.icr is not None else (
-        ebit / estimated_interest if estimated_interest > 0 else 0.0
-    )
+    # Scalars constant across all 6 projected months.
+    ebitda_margin_ratio = ebit / max(data.revenue, 1.0)   # 0-1, matches Taiwanese dataset scale
+
+    if data.interest_expense > 0:
+        icr = ebit / data.interest_expense
+    else:
+        # Zero interest expense: no debt burden (matches zero-debt firms in Taiwanese dataset).
+        icr = 0.0
 
     projections: list[MonthForecast] = []
 
     for i, cf in enumerate(forecasted_cfs):
-        margin = std_dev * (1 + 0.15 * i)
+        margin         = std_dev * (1 + 0.15 * i)
         cash_shortfall = baseline_avg - cf
 
-        # Adjust current assets and equity by the cash shortfall for this month.
+        # Adjust current assets and total assets by the cumulative cash shortfall.
         adj_current_assets = data.currentAssets - cash_shortfall
-        adj_equity = data.equity - cash_shortfall
+        adj_total_assets   = data.totalAssets   - cash_shortfall
 
-        # DSCR
+        # DSCR (display only; derived from the annual debt-service figure in the request).
         dscr_val: float | None = None
         if data.debtService and data.debtService > 0:
             dscr_val = round((cf * 12) / data.debtService, 4)
-        dscr_for_ml = dscr_val if dscr_val is not None else 1.0
 
-        # Quick Ratio
-        quick_ratio: float | None = None
-        if cl > 0:
-            quick_ratio = round((adj_current_assets - inventory) / cl, 4)
+        # Quick and current ratios — used both for display and as ML inputs.
+        quick_ratio_ml   = (adj_current_assets - inventory) / max(cl, 1.0)
+        current_ratio_ml =  adj_current_assets              / max(cl, 1.0)
+        quick_ratio_disp:   float | None = round(quick_ratio_ml,   4) if cl > 0 else None
+        current_ratio_disp: float | None = round(current_ratio_ml, 4) if cl > 0 else None
 
-        # Current Ratio (used both for display and as an ML feature)
-        current_ratio_for_ml = adj_current_assets / cl if cl > 0 else 0.0
-        current_ratio_display: float | None = round(current_ratio_for_ml, 4) if cl > 0 else None
-
-        # Debt-to-equity shifts as equity erodes with the shortfall.
-        debt_to_equity = data.totalDebt / adj_equity if adj_equity != 0 else 0.0
-
-        # Projected Altman Z-Score for this month using adjusted balance sheet.
-        try:
-            z_score = _compute_altman_z(
-                current_assets=adj_current_assets,
-                current_liabilities=cl,
-                total_assets=data.totalAssets,
-                total_debt=data.totalDebt,
-                equity=adj_equity,
-                ebit=ebit,
-                retained_earnings=data.retainedEarnings,
-            )
-        except ValueError:
-            z_score = AltmanZScore(score=0.0, zone="Distress")
-
-        # Build per-month feature row and run ML inference.
-        row = {
-            "current_ratio":  current_ratio_for_ml,
-            "debt_to_equity": debt_to_equity,
-            "ebitda_margin":  ebitda_margin,
-            "icr":            icr,
-            "dscr":           dscr_for_ml,
-            "altman_z_score": z_score.score,
-            "industry":       data.industry,
+        # Reconstruct the month-specific balance sheet and run PoD inference.
+        balance_sheet = {
+            "roa":                 ebit / max(adj_total_assets, 1.0),
+            "current_ratio":       current_ratio_ml,
+            "quick_ratio":         quick_ratio_ml,
+            "ebitda_margin":       ebitda_margin_ratio,
+            "icr":                 icr,
+            "total_debt":          data.totalDebt,
+            "total_assets":        max(adj_total_assets, 1.0),
+            "operating_cash_flow": cf,
+            "total_liabilities":   max(data.totalDebt, 1.0),
         }
-        feature_df = pd.DataFrame([row], columns=_FEATURE_COLS)
-        feature_df["industry"] = pd.Categorical(feature_df["industry"], categories=_industry_cats)
-        pod = float(round(_model.predict_proba(feature_df)[0][1], 4))
+        pod = _pod_predictor.predict_monthly_pod(balance_sheet)
 
         projections.append(MonthForecast(
             month=MONTH_LABELS[i],
@@ -237,8 +210,8 @@ def _project_covenants(
             upperBound=round(cf + margin, 2),
             lowerBound=round(cf - margin, 2),
             dscr=dscr_val,
-            quickRatio=quick_ratio,
-            currentRatio=current_ratio_display,
+            quickRatio=quick_ratio_disp,
+            currentRatio=current_ratio_disp,
             probabilityOfDefault=pod,
         ))
 
@@ -396,11 +369,6 @@ def assess(data: AssessRequest):
 
 @app.post("/api/forecast", response_model=ForecastResponse)
 def forecast_cash_flow(data: ForecastRequest):
-    if data.industry not in _industry_cats:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown industry '{data.industry}'. Accepted values: {_industry_cats}",
-        )
     try:
         forecasted_cfs = _run_des(data.historicalCashFlows)
         baseline_avg = float(np.mean(data.historicalCashFlows))
