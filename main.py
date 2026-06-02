@@ -165,19 +165,23 @@ def _project_covenants(
 
     if data.interest_expense > 0:
         icr = ebit / data.interest_expense
+    elif data.totalDebt == 0:
+        icr = 999.0  # zero-debt firm: no interest burden, set high ceiling
     else:
-        # Zero interest expense: no debt burden (matches zero-debt firms in Taiwanese dataset).
-        icr = 0.0
+        icr = 0.0   # debt exists but interest_expense not provided; conservative fallback
 
     projections: list[MonthForecast] = []
+    cum_cash_delta = 0.0  # running total of monthly CF deviations from historical baseline
 
     for i, cf in enumerate(forecasted_cfs):
-        margin         = std_dev * (1 + 0.15 * i)
-        cash_shortfall = baseline_avg - cf
+        margin = std_dev * (1 + 0.15 * i)
 
-        # Adjust current assets and total assets by the cumulative cash shortfall.
-        adj_current_assets = data.currentAssets - cash_shortfall
-        adj_total_assets   = data.totalAssets   - cash_shortfall
+        # Accumulate each month's deviation so the balance sheet drifts forward in
+        # time rather than resetting to the starting position every iteration.
+        cum_cash_delta += cf - baseline_avg
+
+        adj_current_assets = data.currentAssets + cum_cash_delta
+        adj_total_assets   = data.totalAssets   + cum_cash_delta
 
         # DSCR (display only; derived from the annual debt-service figure in the request).
         dscr_val: float | None = None
