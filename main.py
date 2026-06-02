@@ -90,6 +90,7 @@ class LoanCeilings(BaseModel):
 
 class LoanRecommendation(BaseModel):
     base_max_capacity: float
+    stressed_max_capacity: float
     binding_constraint: str
     status: str
     ceilings: LoanCeilings
@@ -222,66 +223,35 @@ def _project_covenants(
     return projections
 
 
-def _compute_loan_recommendation(
-    data: ForecastRequest,
-    forecasted_cfs: list[float],
-) -> LoanRecommendation:
-    params = data.loan_params or LoanParams()
-    profit_rate = params.profit_rate
-    tenor_months = params.tenor_months
-
-    ltm_ebit = data.revenue - data.expenses
-    # Annualise the 6-month monthly forecast to compare against LTM figures.
-    avg_forecast_ebit = float(np.mean(forecasted_cfs)) * 12.0
-    min_forecast_monthly_cf = float(min(forecasted_cfs))
-    existing_debt_service = data.debtService or 0.0
-    total_existing_debt = data.totalDebt
-    equity = data.equity
-    # D&A not available; use LTM EBIT as a conservative EBITDA proxy.
-    ebitda_proxy = ltm_ebit
-
-    ebit_stress = min(ltm_ebit, 0.8 * avg_forecast_ebit, 12.0 * min_forecast_monthly_cf)
-
+def _run_capacity_calc(
+    ebit_val: float,
+    existing_debt_service: float,
+    total_existing_debt: float,
+    equity: float,
+    ebitda_proxy: float,
+    profit_rate: float,
+    tenor_months: int,
+) -> tuple[float, str, LoanCeilings, list[str]]:
+    """
+    Runs the 4-covenant ceiling calculation for the supplied EBIT figure.
+    Returns (raw_capacity, binding_constraint_name, ceilings, flags).
+    Reused for both the base (LTM EBIT) and stressed (worst-month) scenarios.
+    """
     flags: list[str] = []
 
-    base_inputs: dict = {
-        "ltm_ebit": round(ltm_ebit, 2),
-        "avg_forecast_ebit_annualized": round(avg_forecast_ebit, 2),
-        "min_forecast_monthly_cf": round(min_forecast_monthly_cf, 2),
-        "ebit_stress": round(ebit_stress, 2),
-        "existing_debt_service": round(existing_debt_service, 2),
-        "total_existing_debt": round(total_existing_debt, 2),
-        "equity": round(equity, 2),
-        "profit_rate": profit_rate,
-        "tenor_months": tenor_months,
-    }
+    # Ceiling 1: DSCR — back-solve via PV of annuity
+    max_annual_ds = (ebit_val - existing_debt_service) / 1.25
+    pmt = max_annual_ds / 12.0
+    r   = profit_rate / 12.0
+    dscr_cap = pmt * ((1.0 - (1.0 + r) ** -tenor_months) / r) if r > 0 else pmt * tenor_months
 
-    if ebit_stress <= 0:
-        return LoanRecommendation(
-            base_max_capacity=0.0,
-            binding_constraint="NONE",
-            status="NOT_RECOMMENDED_INSUFFICIENT_EARNINGS",
-            ceilings=LoanCeilings(),
-            inputs_used=base_inputs,
-            flags=["EBIT_STRESS_NON_POSITIVE"],
-        )
+    # Ceiling 2: ICR — max debt s.t. ICR >= 2.0x
+    icr_cap = (ebit_val / 2.0) / profit_rate - total_existing_debt
 
-    # --- Ceiling 1: DSCR (back-solved via PV of annuity) ---
-    max_annual_debt_service = (ebit_stress - existing_debt_service) / 1.25
-    pmt = max_annual_debt_service / 12.0
-    r_monthly = profit_rate / 12.0
-    if r_monthly > 0:
-        dscr_cap = pmt * ((1.0 - (1.0 + r_monthly) ** -tenor_months) / r_monthly)
-    else:
-        dscr_cap = pmt * tenor_months  # zero-rate edge case
-
-    # --- Ceiling 2: ICR (max debt s.t. ICR >= 2.0) ---
-    icr_cap = (ebit_stress / 2.0) / profit_rate - total_existing_debt
-
-    # --- Ceiling 3: Debt / EBITDA <= 3.5x ---
+    # Ceiling 3: Debt / EBITDA <= 3.5x (trailing EBITDA constant across both scenarios)
     debt_ebitda_cap = (3.5 * ebitda_proxy) - total_existing_debt
 
-    # --- Ceiling 4: D/E <= 2.0x (skipped when equity <= 0) ---
+    # Ceiling 4: D/E <= 2.0x (skipped when equity <= 0)
     de_cap: float | None = None
     if equity > 0:
         de_cap = (2.0 * equity) - total_existing_debt
@@ -295,31 +265,89 @@ def _compute_loan_recommendation(
         de_ceiling=round(de_cap, 2) if de_cap is not None else None,
     )
 
-    # --- Binding constraint: smallest positive ceiling ---
     candidates: dict[str, float] = {
-        "dscr_ceiling": dscr_cap,
-        "icr_ceiling": icr_cap,
+        "dscr_ceiling":        dscr_cap,
+        "icr_ceiling":         icr_cap,
         "debt_ebitda_ceiling": debt_ebitda_cap,
     }
     if de_cap is not None:
         candidates["de_ceiling"] = de_cap
 
-    positive_candidates = {k: v for k, v in candidates.items() if v > 0}
+    positive = {k: v for k, v in candidates.items() if v > 0}
+    if not positive:
+        return 0.0, "NONE", ceilings, flags + ["ALL_CONSTRAINTS_NON_POSITIVE"]
 
-    if not positive_candidates:
+    binding_name = min(positive, key=lambda k: positive[k])
+    return positive[binding_name], binding_name, ceilings, flags
+
+
+def _compute_loan_recommendation(
+    data: ForecastRequest,
+    forecasted_cfs: list[float],
+) -> LoanRecommendation:
+    params = data.loan_params or LoanParams()
+    profit_rate  = params.profit_rate
+    tenor_months = params.tenor_months
+
+    ltm_ebit               = data.revenue - data.expenses
+    min_forecast_monthly_cf = float(min(forecasted_cfs))
+    stressed_ebit           = 12.0 * min_forecast_monthly_cf   # worst-month annualised
+    existing_debt_service   = data.debtService or 0.0
+    total_existing_debt     = data.totalDebt
+    equity                  = data.equity
+    ebitda_proxy            = ltm_ebit   # D&A unavailable; LTM EBIT used as conservative proxy
+
+    inputs_used: dict = {
+        "ltm_ebit":                round(ltm_ebit, 2),
+        "stressed_ebit":           round(stressed_ebit, 2),
+        "min_forecast_monthly_cf": round(min_forecast_monthly_cf, 2),
+        "existing_debt_service":   round(existing_debt_service, 2),
+        "total_existing_debt":     round(total_existing_debt, 2),
+        "equity":                  round(equity, 2),
+        "ebitda_proxy":            round(ebitda_proxy, 2),
+        "profit_rate":             profit_rate,
+        "tenor_months":            tenor_months,
+    }
+
+    # --- Early exit: LTM earnings are non-positive — both capacities are 0 ---
+    if ltm_ebit <= 0:
         return LoanRecommendation(
             base_max_capacity=0.0,
+            stressed_max_capacity=0.0,
             binding_constraint="NONE",
-            status="NOT_RECOMMENDED_ALL_CONSTRAINTS_BINDING",
-            ceilings=ceilings,
-            inputs_used={**base_inputs, "ebitda_proxy": round(ebitda_proxy, 2)},
-            flags=flags + ["ALL_CONSTRAINTS_NON_POSITIVE"],
+            status="NOT_RECOMMENDED_INSUFFICIENT_EARNINGS",
+            ceilings=LoanCeilings(),
+            inputs_used=inputs_used,
+            flags=["LTM_EBIT_NON_POSITIVE"],
         )
 
-    binding_name = min(positive_candidates, key=lambda k: positive_candidates[k])
-    base_max_capacity = positive_candidates[binding_name]
+    # --- Base scenario: 4 ceilings driven by LTM EBIT ---
+    base_cap, binding_name, ceilings, flags = _run_capacity_calc(
+        ltm_ebit, existing_debt_service, total_existing_debt,
+        equity, ebitda_proxy, profit_rate, tenor_months,
+    )
 
-    # --- Kafalah hard caps (segment guardrails by trailing revenue) ---
+    if base_cap == 0.0:
+        return LoanRecommendation(
+            base_max_capacity=0.0,
+            stressed_max_capacity=0.0,
+            binding_constraint=binding_name,
+            status="NOT_RECOMMENDED_ALL_CONSTRAINTS_BINDING",
+            ceilings=ceilings,
+            inputs_used=inputs_used,
+            flags=flags,
+        )
+
+    # --- Stressed scenario: same 4 ceilings driven by 12 × worst monthly CF ---
+    if stressed_ebit <= 0:
+        stressed_cap = 0.0
+    else:
+        stressed_cap, _, _, _ = _run_capacity_calc(
+            stressed_ebit, existing_debt_service, total_existing_debt,
+            equity, ebitda_proxy, profit_rate, tenor_months,
+        )
+
+    # --- Kafalah hard caps applied to both scenarios ---
     kafalah_cap_value: int | None = None
     if data.revenue <= 3_000_000:
         kafalah_cap_value = 2_500_000
@@ -329,21 +357,26 @@ def _compute_loan_recommendation(
         kafalah_cap_value = 15_000_000
 
     kafalah_applied = False
-    if kafalah_cap_value is not None and base_max_capacity > kafalah_cap_value:
-        base_max_capacity = float(kafalah_cap_value)
-        kafalah_applied = True
+    if kafalah_cap_value is not None:
+        if base_cap > kafalah_cap_value:
+            base_cap = float(kafalah_cap_value)
+            kafalah_applied = True
+        if stressed_cap > kafalah_cap_value:
+            stressed_cap = float(kafalah_cap_value)
+            kafalah_applied = True
+    if kafalah_applied:
         flags.append(f"KAFALAH_CAP_APPLIED_{kafalah_cap_value:,}_SAR")
 
     return LoanRecommendation(
-        base_max_capacity=round(base_max_capacity, 2),
+        base_max_capacity=round(base_cap, 2),
+        stressed_max_capacity=round(stressed_cap, 2),
         binding_constraint=binding_name,
         status="RECOMMENDED",
         ceilings=ceilings,
         inputs_used={
-            **base_inputs,
-            "ebitda_proxy": round(ebitda_proxy, 2),
+            **inputs_used,
             "kafalah_cap_applied": kafalah_applied,
-            "kafalah_cap_value": kafalah_cap_value,
+            "kafalah_cap_value":   kafalah_cap_value,
         },
         flags=flags,
     )
