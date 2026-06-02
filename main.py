@@ -57,6 +57,11 @@ class AssessResponse(BaseModel):
     altmanZScore: AltmanZScore
 
 
+class LoanParams(BaseModel):
+    profit_rate: float = 0.08
+    tenor_months: int = 36
+
+
 class ForecastRequest(BaseModel):
     historicalCashFlows: list[float]    # time-ordered monthly series (min 2 values)
     currentAssets: float
@@ -72,6 +77,7 @@ class ForecastRequest(BaseModel):
     debtService: float | None = None    # annual figure
     icr: float | None = None            # If absent, proxied from EBIT / estimated interest
     confidenceTier: str = "standard"
+    loan_params: LoanParams | None = None
 
 class MonthForecast(BaseModel):
     month: str
@@ -83,9 +89,26 @@ class MonthForecast(BaseModel):
     currentRatio: float | None
     probabilityOfDefault: float
 
+class LoanCeilings(BaseModel):
+    dscr_ceiling: float | None = None
+    icr_ceiling: float | None = None
+    debt_ebitda_ceiling: float | None = None
+    de_ceiling: float | None = None
+
+
+class LoanRecommendation(BaseModel):
+    base_max_capacity: float
+    binding_constraint: str
+    status: str
+    ceilings: LoanCeilings
+    inputs_used: dict
+    flags: list[str]
+
+
 class ForecastResponse(BaseModel):
     forecastedCashflow: list[MonthForecast]
     confidenceTier: str
+    loan_recommendation: LoanRecommendation
 
 
 # --- 4. Helpers ---
@@ -222,6 +245,133 @@ def _project_covenants(
     return projections
 
 
+def _compute_loan_recommendation(
+    data: ForecastRequest,
+    forecasted_cfs: list[float],
+) -> LoanRecommendation:
+    params = data.loan_params or LoanParams()
+    profit_rate = params.profit_rate
+    tenor_months = params.tenor_months
+
+    ltm_ebit = data.revenue - data.expenses
+    # Annualise the 6-month monthly forecast to compare against LTM figures.
+    avg_forecast_ebit = float(np.mean(forecasted_cfs)) * 12.0
+    min_forecast_monthly_cf = float(min(forecasted_cfs))
+    existing_debt_service = data.debtService or 0.0
+    total_existing_debt = data.totalDebt
+    equity = data.equity
+    # D&A not available; use LTM EBIT as a conservative EBITDA proxy.
+    ebitda_proxy = ltm_ebit
+
+    ebit_stress = min(ltm_ebit, 0.8 * avg_forecast_ebit, 12.0 * min_forecast_monthly_cf)
+
+    flags: list[str] = []
+
+    base_inputs: dict = {
+        "ltm_ebit": round(ltm_ebit, 2),
+        "avg_forecast_ebit_annualized": round(avg_forecast_ebit, 2),
+        "min_forecast_monthly_cf": round(min_forecast_monthly_cf, 2),
+        "ebit_stress": round(ebit_stress, 2),
+        "existing_debt_service": round(existing_debt_service, 2),
+        "total_existing_debt": round(total_existing_debt, 2),
+        "equity": round(equity, 2),
+        "profit_rate": profit_rate,
+        "tenor_months": tenor_months,
+    }
+
+    if ebit_stress <= 0:
+        return LoanRecommendation(
+            base_max_capacity=0.0,
+            binding_constraint="NONE",
+            status="NOT_RECOMMENDED_INSUFFICIENT_EARNINGS",
+            ceilings=LoanCeilings(),
+            inputs_used=base_inputs,
+            flags=["EBIT_STRESS_NON_POSITIVE"],
+        )
+
+    # --- Ceiling 1: DSCR (back-solved via PV of annuity) ---
+    max_annual_debt_service = (ebit_stress - existing_debt_service) / 1.25
+    pmt = max_annual_debt_service / 12.0
+    r_monthly = profit_rate / 12.0
+    if r_monthly > 0:
+        dscr_cap = pmt * ((1.0 - (1.0 + r_monthly) ** -tenor_months) / r_monthly)
+    else:
+        dscr_cap = pmt * tenor_months  # zero-rate edge case
+
+    # --- Ceiling 2: ICR (max debt s.t. ICR >= 2.0) ---
+    icr_cap = (ebit_stress / 2.0) / profit_rate - total_existing_debt
+
+    # --- Ceiling 3: Debt / EBITDA <= 3.5x ---
+    debt_ebitda_cap = (3.5 * ebitda_proxy) - total_existing_debt
+
+    # --- Ceiling 4: D/E <= 2.0x (skipped when equity <= 0) ---
+    de_cap: float | None = None
+    if equity > 0:
+        de_cap = (2.0 * equity) - total_existing_debt
+    else:
+        flags.append("NEGATIVE_OR_ZERO_EQUITY_DE_CONSTRAINT_SKIPPED")
+
+    ceilings = LoanCeilings(
+        dscr_ceiling=round(dscr_cap, 2),
+        icr_ceiling=round(icr_cap, 2),
+        debt_ebitda_ceiling=round(debt_ebitda_cap, 2),
+        de_ceiling=round(de_cap, 2) if de_cap is not None else None,
+    )
+
+    # --- Binding constraint: smallest positive ceiling ---
+    candidates: dict[str, float] = {
+        "dscr_ceiling": dscr_cap,
+        "icr_ceiling": icr_cap,
+        "debt_ebitda_ceiling": debt_ebitda_cap,
+    }
+    if de_cap is not None:
+        candidates["de_ceiling"] = de_cap
+
+    positive_candidates = {k: v for k, v in candidates.items() if v > 0}
+
+    if not positive_candidates:
+        return LoanRecommendation(
+            base_max_capacity=0.0,
+            binding_constraint="NONE",
+            status="NOT_RECOMMENDED_ALL_CONSTRAINTS_BINDING",
+            ceilings=ceilings,
+            inputs_used={**base_inputs, "ebitda_proxy": round(ebitda_proxy, 2)},
+            flags=flags + ["ALL_CONSTRAINTS_NON_POSITIVE"],
+        )
+
+    binding_name = min(positive_candidates, key=lambda k: positive_candidates[k])
+    base_max_capacity = positive_candidates[binding_name]
+
+    # --- Kafalah hard caps (segment guardrails by trailing revenue) ---
+    kafalah_cap_value: int | None = None
+    if data.revenue <= 3_000_000:
+        kafalah_cap_value = 2_500_000
+    elif data.revenue <= 40_000_000:
+        kafalah_cap_value = 5_000_000
+    elif data.revenue <= 200_000_000:
+        kafalah_cap_value = 15_000_000
+
+    kafalah_applied = False
+    if kafalah_cap_value is not None and base_max_capacity > kafalah_cap_value:
+        base_max_capacity = float(kafalah_cap_value)
+        kafalah_applied = True
+        flags.append(f"KAFALAH_CAP_APPLIED_{kafalah_cap_value:,}_SAR")
+
+    return LoanRecommendation(
+        base_max_capacity=round(base_max_capacity, 2),
+        binding_constraint=binding_name,
+        status="RECOMMENDED",
+        ceilings=ceilings,
+        inputs_used={
+            **base_inputs,
+            "ebitda_proxy": round(ebitda_proxy, 2),
+            "kafalah_cap_applied": kafalah_applied,
+            "kafalah_cap_value": kafalah_cap_value,
+        },
+        flags=flags,
+    )
+
+
 # --- 5. Endpoints ---
 
 @app.post("/api/computeAssessment", response_model=AssessResponse)
@@ -255,9 +405,11 @@ def forecast_cash_flow(data: ForecastRequest):
         forecasted_cfs = _run_des(data.historicalCashFlows)
         baseline_avg = float(np.mean(data.historicalCashFlows))
         projections = _project_covenants(data, forecasted_cfs, baseline_avg)
+        loan_rec = _compute_loan_recommendation(data, forecasted_cfs)
         return ForecastResponse(
             forecastedCashflow=projections,
             confidenceTier=data.confidenceTier,
+            loan_recommendation=loan_rec,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
