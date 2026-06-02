@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -63,7 +65,7 @@ class ForecastRequest(BaseModel):
     equity: float
     revenue: float
     expenses: float
-    industry: str | None = None
+    industry: Literal["Construction", "Logistics", "Retail", "SaaS", "Manufacturing", "Tourism", "Healthcare"] | None = None
     retainedEarnings: float | None = None
     inventory: float | None = None
     debtService: float | None = None    # annual figure
