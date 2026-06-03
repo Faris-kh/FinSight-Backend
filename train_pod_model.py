@@ -1,11 +1,21 @@
 """
 PoD Model Training Pipeline
 ----------------------------
-Trains a LightGBM Probability of Default classifier on the Taiwanese Bankruptcy
-Prediction Dataset.
+Trains a LightGBM Probability of Default classifier on the Polish Companies
+Bankruptcy Dataset (UCI ML Repository ID 365, 43,405 observations, 4.8%
+bankruptcy rate across 1–5 year prediction windows).
+
+Feature definitions (source of truth for inference alignment):
+    roa           — A7:  EBIT / total assets
+    current_ratio — A4:  current assets / short-term liabilities
+    quick_ratio   — A46: (current assets − inventory) / short-term liabilities
+    ebit_margin   — A42: profit on operating activities / sales
+    debt_to_assets— A2:  total liabilities / total assets
+    icr           — A27: profit on operating activities / financial expenses
+    dscr_proxy    — A26: (net profit + depreciation) / total liabilities
 
 Usage:
-    python train_pod_model.py [--data path/to/data.csv]
+    python train_pod_model.py [--data path/to/polish_bankruptcy.csv]
 
 Outputs:
     artifacts/lightgbm_pod_model.pkl  — serialised model for FastAPI inference
@@ -28,29 +38,30 @@ from sklearn.model_selection import train_test_split
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-DATA_FILE    = "data.csv"
+DATA_FILE    = "polish_bankruptcy.csv"
 ARTIFACT_DIR = "artifacts"
 MODEL_FILE   = os.path.join(ARTIFACT_DIR, "lightgbm_pod_model.pkl")
-TARGET_COL   = "Bankrupt?"
+TARGET_COL   = "class"
 TEST_SIZE    = 0.20
 RANDOM_SEED  = 42
 
-# Exact column names as they appear in the Taiwanese dataset (after strip).
-# The dict value is the canonical name used in the inference service.
+# Polish dataset column → canonical inference name.
+# Definitions match standard financial ratio conventions; inference formulas
+# must replicate these exactly (see services/forecasting.py).
 FEATURE_MAP: dict[str, str] = {
-    "ROA(C) before interest and depreciation before interest": "roa",
-    "Current Ratio":                                           "current_ratio",
-    "Quick Ratio":                                             "quick_ratio",
-    "Operating Profit Rate":                                   "ebitda_margin",
-    "Debt ratio %":                                            "debt_to_assets",
-    "Interest Coverage Ratio (Interest expense to EBIT)":     "icr",
-    "Cash Flow to Liability":                                  "dscr_proxy",
+    "A7":  "roa",            # EBIT / total assets
+    "A4":  "current_ratio",  # current assets / short-term liabilities
+    "A46": "quick_ratio",    # (current assets − inventory) / short-term liabilities
+    "A42": "ebit_margin",    # profit on operating activities / sales
+    "A2":  "debt_to_assets", # total liabilities / total assets
+    "A27": "icr",            # profit on operating activities / financial expenses
+    "A26": "dscr_proxy",     # (net profit + depreciation) / total liabilities
 }
 
 # Training column order — the inference service MUST present features in this
 # exact sequence when calling predict_proba().
 FEATURE_COLS: list[str] = [
-    "roa", "current_ratio", "quick_ratio", "ebitda_margin",
+    "roa", "current_ratio", "quick_ratio", "ebit_margin",
     "debt_to_assets", "icr", "dscr_proxy",
 ]
 
@@ -61,8 +72,7 @@ def load_and_prepare(path: str) -> tuple[pd.DataFrame, pd.Series]:
     df = pd.read_csv(path)
     df.columns = df.columns.str.strip()
 
-    missing_target = TARGET_COL not in df.columns
-    if missing_target:
+    if TARGET_COL not in df.columns:
         raise ValueError(f"Target column '{TARGET_COL}' not found in {path}.")
 
     missing_feats = [c for c in FEATURE_MAP if c not in df.columns]
@@ -70,6 +80,8 @@ def load_and_prepare(path: str) -> tuple[pd.DataFrame, pd.Series]:
         raise ValueError(f"Dataset is missing expected columns:\n  {missing_feats}")
 
     y = df[TARGET_COL].astype(int)
+    # Select only the 7 feature columns; 'year' and all other metadata columns
+    # are intentionally excluded — they are dataset artefacts, not financial ratios.
     X = (
         df[list(FEATURE_MAP.keys())]
         .rename(columns=FEATURE_MAP)
@@ -151,6 +163,6 @@ def main(data_path: str = DATA_FILE) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the FinSight PoD model.")
     parser.add_argument("--data", default=DATA_FILE,
-                        help=f"Path to the Taiwanese dataset CSV (default: {DATA_FILE})")
+                        help=f"Path to the Polish bankruptcy CSV (default: {DATA_FILE})")
     args = parser.parse_args()
     main(data_path=args.data)

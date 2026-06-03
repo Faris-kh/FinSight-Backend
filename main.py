@@ -2,7 +2,7 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import numpy as np
 
@@ -46,14 +46,16 @@ class AssessRequest(BaseModel):
 class AltmanZScore(BaseModel):
     score: float
     zone: str                           # "Safe" | "Grey" | "Distress"
+    variant: str = "Altman Z'' (Private Non-Manufacturing, 1995)"
 
 class AssessResponse(BaseModel):
     altmanZScore: AltmanZScore
+    flags: list[str] = []
 
 
 class LoanParams(BaseModel):
-    profit_rate: float = 0.08
-    tenor_months: int = 36
+    profit_rate: float = Field(default=0.08, gt=0, le=1.0)
+    tenor_months: int = Field(default=36, gt=0)
 
 
 class ForecastRequest(BaseModel):
@@ -61,7 +63,8 @@ class ForecastRequest(BaseModel):
     currentAssets: float
     currentLiabilities: float
     totalAssets: float
-    totalDebt: float
+    totalDebt: float                    # financial debt — used for D/E covenant ceiling
+    totalLiabilities: float             # all obligations — used for PoD ML features
     equity: float
     revenue: float
     expenses: float
@@ -69,8 +72,8 @@ class ForecastRequest(BaseModel):
     retainedEarnings: float | None = None
     inventory: float | None = None
     debtService: float | None = None    # annual figure
-    interest_expense: float = 0.0       # annual interest expense; used to compute real ICR
-    confidenceTier: str = "standard"
+    interest_expense: float | None = None  # annual interest expense; used to compute real ICR
+    confidenceTier: Literal["narrow", "standard", "wide"] = "standard"
     loan_params: LoanParams | None = None
 
 class MonthForecast(BaseModel):
@@ -82,6 +85,7 @@ class MonthForecast(BaseModel):
     quickRatio: float | None
     currentRatio: float | None
     probabilityOfDefault: float
+    flags: list[str] = []
 
 class LoanCeilings(BaseModel):
     dscr_ceiling: float | None = None
@@ -94,8 +98,10 @@ class LoanRecommendation(BaseModel):
     base_max_capacity: float
     stressed_max_capacity: float
     binding_constraint: str
+    stressed_binding_constraint: str | None = None
     status: str
     ceilings: LoanCeilings
+    stressed_ceilings: LoanCeilings | None = None
     inputs_used: dict
     flags: list[str]
 
@@ -103,12 +109,34 @@ class LoanRecommendation(BaseModel):
 class ForecastResponse(BaseModel):
     forecastedCashflow: list[MonthForecast]
     confidenceTier: str
+    confidenceTier_note: str = "advisory label — does not affect forecast intervals or model inputs"
     loan_recommendation: LoanRecommendation
+    pod_model_notes: list[str]
 
 
 # --- 4. Helpers ---
 
 MONTH_LABELS = ["Month 1", "Month 2", "Month 3", "Month 4", "Month 5", "Month 6"]
+
+# Methodology disclosures returned with every forecast response so consumers
+# know exactly where training and inference definitions diverge.
+_POD_MODEL_NOTES: list[str] = [
+    "Model: LightGBM trained on Polish Companies Bankruptcy Dataset (UCI ID 365, "
+    "43,405 obs., 4.8% bankruptcy rate, 1–5 year prediction windows).",
+    "roa: inference uses projected rolling total_assets (balance sheet drifts "
+    "forward each month); training (Polish A7) used period-end reported total_assets.",
+    "ebit_margin: computed as EBIT / revenue; training feature (Polish A42) is "
+    "operating_profit / sales — equivalent when EBIT ≈ operating_profit.",
+    "dscr_proxy: inference numerator is operating_cash_flow; training (Polish A26) "
+    "used (net_profit + depreciation). Both measure cash generation relative to "
+    "total_liabilities. Denominator is identical.",
+    "debt_to_assets: uses total_liabilities (all obligations), NOT total_debt. "
+    "total_debt is reserved for the scoring-engine D/E covenant ceiling only.",
+    "icr: computed as EBIT / interest_expense — same direction as training "
+    "(Polish A27: operating_profit / financial_expenses; higher = safer). "
+    "Zero-debt firms are capped at 6,961 (Polish A27 p99) rather than a sentinel, "
+    "keeping the value in-distribution.",
+]
 
 
 def _compute_altman_z(
@@ -119,14 +147,30 @@ def _compute_altman_z(
     equity: float,
     ebit: float,
     retained_earnings: float | None,
-) -> AltmanZScore:
+) -> tuple[AltmanZScore, list[str]]:
     if total_assets == 0:
         raise ValueError("totalAssets cannot be zero.")
 
+    flags: list[str] = []
+
     x1 = (current_assets - current_liabilities) / total_assets
-    x2 = (retained_earnings if retained_earnings is not None else equity) / total_assets
+
+    if retained_earnings is None:
+        x2 = equity / total_assets
+        flags.append("X2_RETAINED_EARNINGS_MISSING_EQUITY_SUBSTITUTED")
+    else:
+        x2 = retained_earnings / total_assets
+
     x3 = ebit / total_assets
-    x4 = equity / total_debt if total_debt != 0 else 0.0
+
+    if total_debt != 0:
+        x4 = equity / total_debt
+    else:
+        # Zero-debt firms have an undefined (infinite) equity/debt ratio.
+        # 10.0 is a documented display sentinel; places the firm firmly in Safe
+        # zone without producing an astronomically large score.
+        x4 = 10.0
+        flags.append("X4_ZERO_DEBT_SENTINEL_APPLIED")
 
     score = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
 
@@ -137,12 +181,20 @@ def _compute_altman_z(
     else:
         zone = "Distress"
 
-    return AltmanZScore(score=round(score, 4), zone=zone)
+    return AltmanZScore(
+        score=round(score, 4),
+        zone=zone,
+        variant="Altman Z'' (Private Non-Manufacturing, 1995)",
+    ), flags
 
 
 def _run_des(historical_cfs: list[float], n: int = 6) -> list[float]:
-    if len(historical_cfs) < 2:
-        raise ValueError("At least 2 historical cash flow values are required.")
+    if len(historical_cfs) < 4:
+        raise ValueError(
+            "At least 4 historical cash flow values are required. "
+            "Damped-trend ExponentialSmoothing with estimated initialisation "
+            "is unstable on shorter series."
+        )
     series = np.array(historical_cfs, dtype=float)
     fit = ExponentialSmoothing(
         series,
@@ -163,15 +215,21 @@ def _project_covenants(
     std_dev   = float(np.std(data.historicalCashFlows, ddof=1)) if len(data.historicalCashFlows) >= 2 else 0.0
     ebit      = data.revenue - data.expenses
 
-    # Scalars constant across all 6 projected months.
-    ebitda_margin_ratio = ebit / max(data.revenue, 1.0)   # 0-1, matches Taiwanese dataset scale
+    # ebit_margin: EBIT / revenue — matches Polish A42 (operating profit / sales).
+    # NaN when revenue is zero; flagged per-month below.
+    ebit_margin_ratio: float = ebit / data.revenue if data.revenue != 0 else float("nan")
 
-    if data.interest_expense > 0:
+    icr_flags: list[str] = []
+    if data.interest_expense is not None and data.interest_expense > 0:
         icr = ebit / data.interest_expense
     elif data.totalDebt == 0:
-        icr = 999.0  # zero-debt firm: no interest burden, set high ceiling
+        # Polish A27 p99 ≈ 6,961 — in-distribution upper bound for zero-debt firms.
+        # 999.0 was a sentinel with no basis in the training distribution.
+        icr = 6_961.0
     else:
-        icr = 0.0   # debt exists but interest_expense not provided; conservative fallback
+        icr = 0.0
+        if data.interest_expense is None and data.totalDebt > 0:
+            icr_flags.append("ICR_ASSUMED_ZERO_INTEREST_EXPENSE_NOT_PROVIDED")
 
     projections: list[MonthForecast] = []
     cum_cash_delta = 0.0  # running total of monthly CF deviations from historical baseline
@@ -186,28 +244,52 @@ def _project_covenants(
         adj_current_assets = data.currentAssets + cum_cash_delta
         adj_total_assets   = data.totalAssets   + cum_cash_delta
 
-        # DSCR (display only; derived from the annual debt-service figure in the request).
+        month_flags: list[str] = list(icr_flags)
+
+        # DSCR (display only; single-month CF annualised — not a trailing-12-months figure).
         dscr_val: float | None = None
         if data.debtService and data.debtService > 0:
             dscr_val = round((cf * 12) / data.debtService, 4)
+            month_flags.append("DSCR_IS_SINGLE_MONTH_ANNUALISED_NOT_TTM")
 
-        # Quick and current ratios — used both for display and as ML inputs.
-        quick_ratio_ml   = (adj_current_assets - inventory) / max(cl, 1.0)
-        current_ratio_ml =  adj_current_assets              / max(cl, 1.0)
-        quick_ratio_disp:   float | None = round(quick_ratio_ml,   4) if cl > 0 else None
-        current_ratio_disp: float | None = round(current_ratio_ml, 4) if cl > 0 else None
+        # Current and quick ratios: undefined when current_liabilities is zero.
+        # NaN propagates into the ML feature row; LightGBM routes it via its
+        # trained missing-value branch rather than receiving a fake denominator.
+        if cl > 0:
+            quick_ratio_ml   = (adj_current_assets - inventory) / cl
+            current_ratio_ml =  adj_current_assets              / cl
+            quick_ratio_disp:   float | None = round(quick_ratio_ml,   4)
+            current_ratio_disp: float | None = round(current_ratio_ml, 4)
+            if data.inventory is None:
+                month_flags.append("QUICK_RATIO_INVENTORY_ASSUMED_ZERO")
+        else:
+            quick_ratio_ml   = float("nan")
+            current_ratio_ml = float("nan")
+            quick_ratio_disp   = None
+            current_ratio_disp = None
+            month_flags.append("QUICK_CURRENT_RATIO_UNDEFINED_ZERO_CURRENT_LIABILITIES")
 
-        # Reconstruct the month-specific balance sheet and run PoD inference.
+        # ROA: undefined when projected total_assets is zero (extreme insolvency).
+        if adj_total_assets != 0:
+            roa_feature: float = ebit / adj_total_assets
+        else:
+            roa_feature = float("nan")
+            month_flags.append("ROA_UNDEFINED_ZERO_PROJECTED_ASSETS")
+
+        if np.isnan(ebit_margin_ratio):
+            month_flags.append("EBIT_MARGIN_UNDEFINED_ZERO_REVENUE")
+
+        # Balance sheet passed to PoD inference.
+        # total_liabilities is the real input field — total_debt is NOT used here.
         balance_sheet = {
-            "roa":                 ebit / max(adj_total_assets, 1.0),
+            "roa":                 roa_feature,
             "current_ratio":       current_ratio_ml,
             "quick_ratio":         quick_ratio_ml,
-            "ebitda_margin":       ebitda_margin_ratio,
+            "ebit_margin":         ebit_margin_ratio,
             "icr":                 icr,
-            "total_debt":          data.totalDebt,
-            "total_assets":        max(adj_total_assets, 1.0),
+            "total_assets":        adj_total_assets,
             "operating_cash_flow": cf,
-            "total_liabilities":   max(data.totalDebt, 1.0),
+            "total_liabilities":   data.totalLiabilities,
         }
         pod = _pod_predictor.predict_monthly_pod(balance_sheet)
 
@@ -220,6 +302,7 @@ def _project_covenants(
             quickRatio=quick_ratio_disp,
             currentRatio=current_ratio_disp,
             probabilityOfDefault=pod,
+            flags=month_flags,
         ))
 
     return projections
@@ -230,7 +313,7 @@ def _run_capacity_calc(
     existing_debt_service: float,
     total_existing_debt: float,
     equity: float,
-    ebitda_proxy: float,
+    ebit_proxy: float,
     profit_rate: float,
     tenor_months: int,
 ) -> tuple[float, str, LoanCeilings, list[str]]:
@@ -250,8 +333,8 @@ def _run_capacity_calc(
     # Ceiling 2: ICR — max debt s.t. ICR >= 2.0x
     icr_cap = (ebit_val / 2.0) / profit_rate - total_existing_debt
 
-    # Ceiling 3: Debt / EBITDA <= 3.5x (trailing EBITDA constant across both scenarios)
-    debt_ebitda_cap = (3.5 * ebitda_proxy) - total_existing_debt
+    # Ceiling 3: Debt / EBIT <= 3.5x (EBIT proxy; D&A unavailable; constant across both scenarios)
+    debt_ebitda_cap = (3.5 * ebit_proxy) - total_existing_debt
 
     # Ceiling 4: D/E <= 2.0x (skipped when equity <= 0)
     de_cap: float | None = None
@@ -293,23 +376,31 @@ def _compute_loan_recommendation(
 
     ltm_ebit               = data.revenue - data.expenses
     min_forecast_monthly_cf = float(min(forecasted_cfs))
-    stressed_ebit           = 12.0 * min_forecast_monthly_cf   # worst-month annualised
-    existing_debt_service   = data.debtService or 0.0
+    stressed_ebit           = 12.0 * min_forecast_monthly_cf
+    debt_service_absent     = data.debtService is None
+    existing_debt_service   = data.debtService if not debt_service_absent else 0.0
     total_existing_debt     = data.totalDebt
     equity                  = data.equity
-    ebitda_proxy            = ltm_ebit   # D&A unavailable; LTM EBIT used as conservative proxy
+    ebit_proxy              = ltm_ebit
 
     inputs_used: dict = {
         "ltm_ebit":                round(ltm_ebit, 2),
         "stressed_ebit":           round(stressed_ebit, 2),
+        "stressed_ebit_note":      "12 × worst forecast monthly CF; monthly CF used as EBIT proxy — may diverge from period EBIT",
         "min_forecast_monthly_cf": round(min_forecast_monthly_cf, 2),
         "existing_debt_service":   round(existing_debt_service, 2),
+        "debt_service_absent":     debt_service_absent,
         "total_existing_debt":     round(total_existing_debt, 2),
         "equity":                  round(equity, 2),
-        "ebitda_proxy":            round(ebitda_proxy, 2),
+        "ebit_proxy":              round(ebit_proxy, 2),
         "profit_rate":             profit_rate,
         "tenor_months":            tenor_months,
+        "icr_ceiling_assumption":  "profit_rate used as proxy for borrower's blended cost of debt in ICR ceiling",
     }
+
+    pre_flags: list[str] = []
+    if debt_service_absent:
+        pre_flags.append("DEBT_SERVICE_ASSUMED_ZERO_NOT_PROVIDED")
 
     # --- Early exit: LTM earnings are non-positive — both capacities are 0 ---
     if ltm_ebit <= 0:
@@ -320,14 +411,15 @@ def _compute_loan_recommendation(
             status="NOT_RECOMMENDED_INSUFFICIENT_EARNINGS",
             ceilings=LoanCeilings(),
             inputs_used=inputs_used,
-            flags=["LTM_EBIT_NON_POSITIVE"],
+            flags=pre_flags + ["LTM_EBIT_NON_POSITIVE"],
         )
 
     # --- Base scenario: 4 ceilings driven by LTM EBIT ---
     base_cap, binding_name, ceilings, flags = _run_capacity_calc(
         ltm_ebit, existing_debt_service, total_existing_debt,
-        equity, ebitda_proxy, profit_rate, tenor_months,
+        equity, ebit_proxy, profit_rate, tenor_months,
     )
+    flags = pre_flags + flags
 
     if base_cap == 0.0:
         return LoanRecommendation(
@@ -343,10 +435,12 @@ def _compute_loan_recommendation(
     # --- Stressed scenario: same 4 ceilings driven by 12 × worst monthly CF ---
     if stressed_ebit <= 0:
         stressed_cap = 0.0
+        stressed_binding = "NONE"
+        stressed_ceilings_val = LoanCeilings()
     else:
-        stressed_cap, _, _, _ = _run_capacity_calc(
+        stressed_cap, stressed_binding, stressed_ceilings_val, _ = _run_capacity_calc(
             stressed_ebit, existing_debt_service, total_existing_debt,
-            equity, ebitda_proxy, profit_rate, tenor_months,
+            equity, ebit_proxy, profit_rate, tenor_months,
         )
 
     # --- Kafalah hard caps applied to both scenarios ---
@@ -357,6 +451,8 @@ def _compute_loan_recommendation(
         kafalah_cap_value = 5_000_000
     elif data.revenue <= 200_000_000:
         kafalah_cap_value = 15_000_000
+    else:
+        flags.append("KAFALAH_CAP_NOT_APPLICABLE_REVENUE_EXCEEDS_200M_SAR")
 
     kafalah_applied = False
     if kafalah_cap_value is not None:
@@ -373,8 +469,10 @@ def _compute_loan_recommendation(
         base_max_capacity=round(base_cap, 2),
         stressed_max_capacity=round(stressed_cap, 2),
         binding_constraint=binding_name,
+        stressed_binding_constraint=stressed_binding,
         status="RECOMMENDED",
         ceilings=ceilings,
+        stressed_ceilings=stressed_ceilings_val,
         inputs_used={
             **inputs_used,
             "kafalah_cap_applied": kafalah_applied,
@@ -390,7 +488,7 @@ def _compute_loan_recommendation(
 def assess(data: AssessRequest):
     try:
         ebit = data.revenue - data.expenses
-        z_score = _compute_altman_z(
+        z_score, z_flags = _compute_altman_z(
             current_assets=data.currentAssets,
             current_liabilities=data.currentLiabilities,
             total_assets=data.totalAssets,
@@ -399,7 +497,7 @@ def assess(data: AssessRequest):
             ebit=ebit,
             retained_earnings=data.retainedEarnings,
         )
-        return AssessResponse(altmanZScore=z_score)
+        return AssessResponse(altmanZScore=z_score, flags=z_flags)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -417,6 +515,7 @@ def forecast_cash_flow(data: ForecastRequest):
             forecastedCashflow=projections,
             confidenceTier=data.confidenceTier,
             loan_recommendation=loan_rec,
+            pod_model_notes=_POD_MODEL_NOTES,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
