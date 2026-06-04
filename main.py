@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from pmdarima import auto_arima
 import numpy as np
 
 from services.forecasting import PodPredictor
@@ -110,6 +111,8 @@ class ForecastResponse(BaseModel):
     forecastedCashflow: list[MonthForecast]
     confidenceTier: str
     confidence_band_note: str
+    forecast_method: str            # "ARIMA" or "DES" — the method that produced the numbers
+    forecast_flags: list[str] = []  # e.g. ["ARIMA_FAILED_FELL_BACK_TO_DES"]
     loan_recommendation: LoanRecommendation
     pod_model_notes: list[str]
 
@@ -194,6 +197,10 @@ def _compute_altman_z(
     ), flags
 
 
+# Minimum real months required to route to ARIMA instead of DES.
+_ARIMA_MIN_HISTORY: int = 24
+
+
 def _run_des(historical_cfs: list[float], n: int = 6) -> list[float]:
     if len(historical_cfs) < 4:
         raise ValueError(
@@ -209,6 +216,51 @@ def _run_des(historical_cfs: list[float], n: int = 6) -> list[float]:
         initialization_method="estimated",
     ).fit(optimized=True)
     return fit.forecast(n).tolist()
+
+
+def _run_arima(historical_cfs: list[float], n: int = 6) -> list[float]:
+    """
+    Fit ARIMA on the full historical series and forecast n steps.
+    Search space is bounded (max p/d/q = 3/2/3) to keep per-request latency
+    under ~600 ms even on lumpy SME series. auto_arima selects order via AIC.
+    Raises ValueError when the fit produces non-finite or explosive forecasts.
+    """
+    series = np.array(historical_cfs, dtype=float)
+    model = auto_arima(
+        series,
+        seasonal=False,
+        information_criterion="aic",
+        max_p=3, max_d=2, max_q=3,
+        start_p=0, start_q=0, d=None,
+        error_action="ignore",
+        suppress_warnings=True,
+    )
+    forecasts = np.asarray(model.predict(n), dtype=float)
+    if not all(np.isfinite(v) for v in forecasts):
+        raise ValueError("ARIMA produced non-finite forecast values.")
+    hist_mean = float(np.abs(series).mean()) or 1.0
+    if any(abs(v) > hist_mean * 100 for v in forecasts):
+        # Explosive divergence — treat as degenerate fit.
+        raise ValueError("ARIMA forecast diverges beyond 100× historical mean.")
+    return forecasts.tolist()
+
+
+def _route_forecast(
+    historical_cfs: list[float],
+) -> tuple[list[float], str, list[str]]:
+    """
+    Length-adaptive router.
+    >=24 real months → ARIMA; <24 → DES.
+    DES is the fallback when ARIMA fails; a flag is emitted when fallback fires.
+    Returns (forecasted_cfs, method_used, forecast_flags).
+    """
+    flags: list[str] = []
+    if len(historical_cfs) >= _ARIMA_MIN_HISTORY:
+        try:
+            return _run_arima(historical_cfs), "ARIMA", flags
+        except Exception:
+            flags.append("ARIMA_FAILED_FELL_BACK_TO_DES")
+    return _run_des(historical_cfs), "DES", flags
 
 
 def _project_covenants(
@@ -514,19 +566,31 @@ def assess(data: AssessRequest):
 @app.post("/api/forecast", response_model=ForecastResponse)
 def forecast_cash_flow(data: ForecastRequest):
     try:
-        forecasted_cfs = _run_des(data.historicalCashFlows)
+        forecasted_cfs, method, forecast_flags = _route_forecast(data.historicalCashFlows)
         baseline_avg = float(np.mean(data.historicalCashFlows))
         projections = _project_covenants(data, forecasted_cfs, baseline_avg)
         loan_rec = _compute_loan_recommendation(data, forecasted_cfs)
         band_mult = _TIER_MULTIPLIERS[data.confidenceTier]
+        if method == "ARIMA":
+            band_note = (
+                f"{data.confidenceTier} (±{band_mult:.1f}σ) — "
+                "tier-based σ-bands applied to ARIMA forecast; "
+                "ARIMA native prediction intervals not used — "
+                "tier-based bands kept for display consistency across methods; "
+                "does not affect point forecast or model inputs"
+            )
+        else:
+            band_note = (
+                f"{data.confidenceTier} (±{band_mult:.1f}σ) — "
+                "tier-based σ-bands applied to DES forecast; "
+                "does not affect point forecast or model inputs"
+            )
         return ForecastResponse(
             forecastedCashflow=projections,
             confidenceTier=data.confidenceTier,
-            confidence_band_note=(
-                f"{data.confidenceTier} (±{band_mult:.1f}σ) — "
-                "applied to DES forecast upper/lower bounds; "
-                "does not affect point forecast or model inputs"
-            ),
+            confidence_band_note=band_note,
+            forecast_method=method,
+            forecast_flags=forecast_flags,
             loan_recommendation=loan_rec,
             pod_model_notes=_POD_MODEL_NOTES,
         )
@@ -540,4 +604,7 @@ def forecast_cash_flow(data: ForecastRequest):
 
 @app.get("/")
 def health_check():
-    return {"status": "FinSight API is running", "model": "DES + LightGBM Risk Classifier"}
+    return {
+        "status": "FinSight API is running",
+        "forecast": f"ARIMA (≥{_ARIMA_MIN_HISTORY} months) / DES fallback + LightGBM Risk Classifier",
+    }
