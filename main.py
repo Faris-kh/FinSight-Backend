@@ -109,7 +109,7 @@ class LoanRecommendation(BaseModel):
 class ForecastResponse(BaseModel):
     forecastedCashflow: list[MonthForecast]
     confidenceTier: str
-    confidenceTier_note: str = "advisory label — does not affect forecast intervals or model inputs"
+    confidence_band_note: str
     loan_recommendation: LoanRecommendation
     pod_model_notes: list[str]
 
@@ -117,6 +117,12 @@ class ForecastResponse(BaseModel):
 # --- 4. Helpers ---
 
 MONTH_LABELS = ["Month 1", "Month 2", "Month 3", "Month 4", "Month 5", "Month 6"]
+
+_TIER_MULTIPLIERS: dict[str, float] = {
+    "narrow":   1.0,
+    "standard": 1.5,
+    "wide":     2.0,
+}
 
 # Methodology disclosures returned with every forecast response so consumers
 # know exactly where training and inference definitions diverge.
@@ -210,10 +216,11 @@ def _project_covenants(
     forecasted_cfs: list[float],
     baseline_avg: float,
 ) -> list[MonthForecast]:
-    inventory = data.inventory or 0.0
-    cl        = data.currentLiabilities
-    std_dev   = float(np.std(data.historicalCashFlows, ddof=1)) if len(data.historicalCashFlows) >= 2 else 0.0
-    ebit      = data.revenue - data.expenses
+    inventory        = data.inventory or 0.0
+    cl               = data.currentLiabilities
+    std_dev          = float(np.std(data.historicalCashFlows, ddof=1)) if len(data.historicalCashFlows) >= 2 else 0.0
+    ebit             = data.revenue - data.expenses
+    band_multiplier  = _TIER_MULTIPLIERS[data.confidenceTier]
 
     # ebit_margin: EBIT / revenue — matches Polish A42 (operating profit / sales).
     # NaN when revenue is zero; flagged per-month below.
@@ -235,7 +242,7 @@ def _project_covenants(
     cum_cash_delta = 0.0  # running total of monthly CF deviations from historical baseline
 
     for i, cf in enumerate(forecasted_cfs):
-        margin = std_dev * (1 + 0.15 * i)
+        margin = std_dev * (1 + 0.15 * i) * band_multiplier
 
         # Accumulate each month's deviation so the balance sheet drifts forward in
         # time rather than resetting to the starting position every iteration.
@@ -297,7 +304,7 @@ def _project_covenants(
             month=MONTH_LABELS[i],
             forecastedCashFlow=round(cf, 2),
             upperBound=round(cf + margin, 2),
-            lowerBound=round(cf - margin, 2),
+            lowerBound=round(max(0.0, cf - margin), 2),
             dscr=dscr_val,
             quickRatio=quick_ratio_disp,
             currentRatio=current_ratio_disp,
@@ -511,9 +518,15 @@ def forecast_cash_flow(data: ForecastRequest):
         baseline_avg = float(np.mean(data.historicalCashFlows))
         projections = _project_covenants(data, forecasted_cfs, baseline_avg)
         loan_rec = _compute_loan_recommendation(data, forecasted_cfs)
+        band_mult = _TIER_MULTIPLIERS[data.confidenceTier]
         return ForecastResponse(
             forecastedCashflow=projections,
             confidenceTier=data.confidenceTier,
+            confidence_band_note=(
+                f"{data.confidenceTier} (±{band_mult:.1f}σ) — "
+                "applied to DES forecast upper/lower bounds; "
+                "does not affect point forecast or model inputs"
+            ),
             loan_recommendation=loan_rec,
             pod_model_notes=_POD_MODEL_NOTES,
         )
